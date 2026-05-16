@@ -7,7 +7,7 @@ requires-python = ">=3.9"
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/YOUR_USERNAME/ComfyUI-Dropdown-Switch"
+Repository = "https://github.com/DRuggeri/ComfyUI-Dropdown-Switch"
 
 [tool.comfy]
 PublisherId = ""
