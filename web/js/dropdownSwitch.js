@@ -313,10 +313,40 @@ function patchGraphToPrompt(comfyApp) {
   if (!original) return;
 
   comfyApp.graphToPrompt = async function (...args) {
-    const result = await original(...args);
-    if (!result?.output) return result;
-
     const graph = comfyApp.graph;
+
+    // ── Pre-serialise: disconnect unselected inputs ──────────────────────────
+    // Temporarily null out the link IDs for every unselected DropdownSwitch
+    // input before calling graphToPrompt.  This ensures ComfyUI's serialiser
+    // never traverses to those upstream nodes, so their subgraph internals
+    // won't appear in result.output and the backend won't execute them.
+    const savedLinks = [];
+    if (graph) {
+      for (const n of graph._nodes ?? []) {
+        if (n.type !== NODE_TYPE || !n._choiceWidget) continue;
+        const selIdx = n.selectedIndex;
+        for (let i = 0; i < (n.inputs?.length ?? 0); i++) {
+          if (i === selIdx) continue;
+          const inp = n.inputs[i];
+          if (inp?.link != null) {
+            savedLinks.push({ inp, link: inp.link });
+            inp.link = null;
+          }
+        }
+      }
+    }
+
+    let result;
+    try {
+      result = await original(...args);
+    } finally {
+      // Always restore, even if original() throws.
+      for (const { inp, link } of savedLinks) {
+        inp.link = link;
+      }
+    }
+
+    if (!result?.output) return result;
     if (!graph) return result;
 
     const nodeMap = {};
@@ -383,10 +413,85 @@ function patchGraphToPrompt(comfyApp) {
         if ("value" in resolved) {
           serialisedNode.inputs[liveNode.inputs[inputIdx].name] = resolved.value;
         } else if (resolved.nodeId !== undefined) {
-          serialisedNode.inputs[liveNode.inputs[inputIdx].name] = [
-            String(resolved.nodeId),
-            resolved.outputIndex,
-          ];
+          // Only rewrite the link if the resolved target is a real backend node
+          // (present in result.output). If it isn't — e.g. it's a subgraph or
+          // another virtual node — leave the entry alone so ComfyUI's own
+          // virtual-node resolution can handle it correctly.
+          if (result.output[String(resolved.nodeId)]) {
+            serialisedNode.inputs[liveNode.inputs[inputIdx].name] = [
+              String(resolved.nodeId),
+              resolved.outputIndex,
+            ];
+          }
+        }
+      }
+    }
+
+    // ── Phase 2: GC – prune nodes unreachable from any output node ──────────
+    // Subgraph expansion is unconditional: all internal nodes appear in
+    // result.output regardless of whether the subgraph container is connected.
+    // Pre-serialisation link-nulling alone cannot prevent this.  Instead we do
+    // a backward reachability traversal from every OUTPUT_NODE=True node in the
+    // serialised graph and delete anything that isn't reachable.
+    {
+      // ── Find which class_types are output nodes (try several strategies) ──
+      const outputClassTypes = new Set();
+
+      // Strategy 1: LiteGraph registered_node_types (classic frontend)
+      const LG_ref = getLG();
+      if (LG_ref?.registered_node_types) {
+        for (const [type, cls] of Object.entries(LG_ref.registered_node_types)) {
+          if (cls?.output_node || cls?.nodeData?.output_node) outputClassTypes.add(type);
+        }
+      }
+
+      // Strategy 2: comfyApp.nodeOutputTypes Set (newer ComfyUI frontend)
+      if (comfyApp?.nodeOutputTypes) {
+        for (const t of comfyApp.nodeOutputTypes) outputClassTypes.add(t);
+      }
+
+      // Strategy 3: inspect constructor of live top-level graph nodes
+      // output_node lives at constructor.nodeData.output_node in this ComfyUI build
+      for (const n of graph._nodes ?? []) {
+        if (n.constructor?.output_node || n.constructor?.nodeData?.output_node) outputClassTypes.add(n.type);
+      }
+
+      if (outputClassTypes.size > 0) {
+        const reachable = new Set();
+        const markReachable = (nodeId) => {
+          if (reachable.has(nodeId)) return;
+          reachable.add(nodeId);
+          const nd = result.output[nodeId];
+          if (!nd) return;
+          for (const v of Object.values(nd.inputs ?? {})) {
+            if (Array.isArray(v) && v.length >= 2 && typeof v[0] === "string") {
+              markReachable(v[0]);
+            }
+          }
+        };
+
+        let outputNodeCount = 0;
+        for (const [nodeId, nd] of Object.entries(result.output)) {
+          // Only seed GC from top-level nodes (those in the live graph's nodeMap).
+          // Subgraph-internal nodes have colon-format IDs like "642:638"; those
+          // won't resolve in nodeMap, so their internal output nodes (SaveImage,
+          // audio outputs, etc.) don't anchor the whole unselected subgraph branch
+          // as "reachable" and those nodes get pruned correctly.
+          if (!nodeMap[Number(nodeId)]) continue;
+          if (outputClassTypes.has(nd.class_type)) {
+            outputNodeCount++;
+            markReachable(nodeId);
+          }
+        }
+
+        if (outputNodeCount > 0) {
+          let pruned = 0;
+          for (const nodeId of Object.keys(result.output)) {
+            if (!reachable.has(nodeId)) {
+              delete result.output[nodeId];
+              pruned++;
+            }
+          }
         }
       }
     }
