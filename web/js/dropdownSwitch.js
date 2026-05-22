@@ -154,7 +154,53 @@ function buildNodeClass(LG) {
 
   // ── context menu ──────────────────────────────────────────────────────────
 
-  getExtraMenuOptions(_canvas, options) {
+  getExtraMenuOptions(canvas, options) {
+    // ── Slot-specific options (move / insert) ──────────────────────────────
+    // Detect which input slot the right-click landed on.
+    const mouse = canvas?.graph_mouse;
+    const slotH = LG.NODE_SLOT_HEIGHT ?? 20;
+    let hoveredSlot = -1;
+    if (mouse) {
+      // Exclude the trailing empty slot (always last)
+      for (let i = 0; i < this.inputs.length - 1; i++) {
+        const pos = this.getConnectionPos(true, i);
+        if (Math.abs(pos[1] - mouse[1]) < slotH * 0.65) {
+          hoveredSlot = i;
+          break;
+        }
+      }
+    }
+
+    if (hoveredSlot >= 0) {
+      const lbl = this._labels[hoveredSlot] ?? `slot ${hoveredSlot}`;
+      options.push(
+        { content: `✏️ Rename "${lbl}"`,
+          callback: () => {
+            const newName = prompt(`Rename input "${lbl}" to:`, lbl);
+            if (newName !== null) {
+              this._renameInput(hoveredSlot, newName);
+              this.setDirtyCanvas(true, true);
+            }
+          } },
+        { content: `📌 Insert above "${lbl}"`,
+          callback: () => this._insertInputAt(hoveredSlot) },
+      );
+      if (hoveredSlot > 0) {
+        options.push(
+          { content: `↑ Move "${lbl}" up`,
+            callback: () => this._moveInput(hoveredSlot, hoveredSlot - 1) },
+        );
+      }
+      if (hoveredSlot < this.inputs.length - 2) {
+        options.push(
+          { content: `↓ Move "${lbl}" down`,
+            callback: () => this._moveInput(hoveredSlot, hoveredSlot + 1) },
+        );
+      }
+      options.push(null); // separator before global options
+    }
+
+    // ── Global options ─────────────────────────────────────────────────────
     options.push(
       {
         content:  "➕ Add Input",
@@ -185,15 +231,89 @@ function buildNodeClass(LG) {
     );
   }
 
+  // ── input reordering & insertion ──────────────────────────────────────────
+
+  /** Swap two input slots, keeping graph link references consistent. */
+  _moveInput(fromIdx, toIdx) {
+    if (fromIdx === toIdx) return;
+    const len = this.inputs.length;
+    if (fromIdx < 0 || toIdx < 0 || fromIdx >= len || toIdx >= len) return;
+
+    // Swap the slot objects (each carries .name, .type, .link)
+    [this.inputs[fromIdx], this.inputs[toIdx]] =
+      [this.inputs[toIdx], this.inputs[fromIdx]];
+
+    // Swap labels
+    [this._labels[fromIdx], this._labels[toIdx]] =
+      [this._labels[toIdx], this._labels[fromIdx]];
+
+    // Update every graph link that targets this node
+    for (const link of Object.values(this.graph?.links ?? {})) {
+      if (link.target_id !== this.id) continue;
+      if      (link.target_slot === fromIdx) link.target_slot = toIdx;
+      else if (link.target_slot === toIdx)   link.target_slot = fromIdx;
+    }
+
+    // Re-sync combo, preserving the currently selected label by name
+    const sel = this._choiceWidget?.value;
+    this._syncChoiceValues();
+    if (sel != null && this._labels.includes(sel)) this._choiceWidget.value = sel;
+
+    this.setDirtyCanvas(true, true);
+  }
+
+  /** Insert a new empty input slot at position i, shifting later slots down. */
+  _insertInputAt(i) {
+    // Find a unique label
+    let n = 1;
+    while (this._labels.includes(`input_${n}`)) n++;
+    const newName = `input_${n}`;
+
+    // addInput always appends; pop it off the end and splice into position
+    this.addInput(newName, "*");
+    const newSlot = this.inputs.pop();
+    this.inputs.splice(i, 0, newSlot);
+    this._labels.splice(i, 0, newName);
+
+    // Slots that were at index >= i are now at index >= i+1
+    for (const link of Object.values(this.graph?.links ?? {})) {
+      if (link.target_id !== this.id) continue;
+      if (link.target_slot >= i) link.target_slot++;
+    }
+
+    const sel = this._choiceWidget?.value;
+    this._syncChoiceValues();
+    if (sel != null && this._labels.includes(sel)) this._choiceWidget.value = sel;
+
+    this._autoSize();
+    this.setDirtyCanvas(true, true);
+  }
+
   // ── connection events ─────────────────────────────────────────────────────
 
   /**
    * Auto-add a new empty slot whenever the last existing slot gets connected.
    * Also clean up any trailing empty (disconnected) slots beyond one.
    */
-  onConnectionsChange(type, _slotIndex, _connected, _link, _ioSlot) {
+  onConnectionsChange(type, _slotIndex, connected, _link, _ioSlot) {
     if (type !== LG.INPUT) return;
 
+    if (connected) {
+      // Connection added: clean up immediately.
+      this._cleanupInputSlots();
+    } else {
+      // Connection removed: defer cleanup by one tick.
+      // If LiteGraph is replacing an existing wire it fires the disconnect
+      // event first, then the connect event.  Running cleanup immediately
+      // would shift slot indices before the new wire is attached, causing
+      // it to land on the wrong slot.  Deferring lets the reconnect happen
+      // first; by the time the timeout fires the slot is filled again and
+      // won't be removed.
+      setTimeout(() => this._cleanupInputSlots(), 0);
+    }
+  }
+
+  _cleanupInputSlots() {
     // Remove every empty slot except the one trailing empty.
     // Iterate high → low so earlier indices stay valid after each removal.
     const len = this.inputs.length;
