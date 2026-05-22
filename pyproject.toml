@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-dropdown-switch"
-version = "1.0.0"
+version = "1.0.1"
 description = "A frontend-only ComfyUI node that routes one of several inputs to the output based on a dropdown selection."
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
@@ -10,6 +10,6 @@ dependencies = []
 Repository = "https://github.com/DRuggeri/ComfyUI-Dropdown-Switch"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "druggeri"
 DisplayName = "Dropdown Switch"
 Icon = ""
