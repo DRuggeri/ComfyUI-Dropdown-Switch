@@ -297,38 +297,20 @@ function buildNodeClass(LG) {
    */
   onConnectionsChange(type, _slotIndex, connected, _link, _ioSlot) {
     if (type !== LG.INPUT) return;
-
-    if (connected) {
-      // Connection added: clean up immediately.
-      this._cleanupInputSlots();
-    } else {
-      // Connection removed: defer cleanup by one tick.
-      // If LiteGraph is replacing an existing wire it fires the disconnect
-      // event first, then the connect event.  Running cleanup immediately
-      // would shift slot indices before the new wire is attached, causing
-      // it to land on the wrong slot.  Deferring lets the reconnect happen
-      // first; by the time the timeout fires the slot is filled again and
-      // won't be removed.
-      setTimeout(() => this._cleanupInputSlots(), 0);
-    }
+    // Any connection change: ensure there is still a trailing empty slot.
+    // We never auto-remove slots because they may be empty-but-labelled options
+    // the user deliberately added (e.g. 40 model options where only one is wired).
+    this._cleanupInputSlots();
   }
 
   _cleanupInputSlots() {
-    // Remove every empty slot except the one trailing empty.
-    // Iterate high → low so earlier indices stay valid after each removal.
-    const len = this.inputs.length;
-    for (let i = len - 2; i >= 0; i--) {
-      if (this.inputs[i] && this.inputs[i].link == null) {
-        this._removeDynamicInput(i);
-      }
-    }
-
-    // Guarantee exactly one trailing empty slot.
+    // Only guarantee there is at least one trailing empty slot.
+    // Empty slots are NEVER auto-removed — the user explicitly created them
+    // as labelled options and they must persist even when not connected.
     const last = this.inputs[this.inputs.length - 1];
     if (!last || last.link != null) {
       this._addDynamicInput();
     }
-
     this.setDirtyCanvas(true, true);
   }
 
@@ -435,6 +417,12 @@ function patchGraphToPrompt(comfyApp) {
   comfyApp.graphToPrompt = async function (...args) {
     const graph = comfyApp.graph;
 
+    // ── Capture full workflow state BEFORE nulling any links ─────────────────
+    // graphToPrompt() returns { workflow, output }.  workflow is what ComfyUI
+    // saves to disk / history.  We must capture it with all links intact so
+    // the saved file can be reloaded correctly.
+    const fullWorkflow = graph?.serialize ? graph.serialize() : null;
+
     // ── Pre-serialise: disconnect unselected inputs ──────────────────────────
     // Temporarily null out the link IDs for every unselected DropdownSwitch
     // input before calling graphToPrompt.  This ensures ComfyUI's serialiser
@@ -464,6 +452,15 @@ function patchGraphToPrompt(comfyApp) {
       for (const { inp, link } of savedLinks) {
         inp.link = link;
       }
+    }
+
+    // ── Restore full workflow in the result ──────────────────────────────────
+    // original() serialised the graph with our nulled links, so result.workflow
+    // would have only the selected link.  Replace it with the pre-captured full
+    // state so that ComfyUI saves (history, auto-save, Ctrl+S) preserve all
+    // connections and the workflow reloads correctly.
+    if (result?.workflow && fullWorkflow) {
+      result.workflow = fullWorkflow;
     }
 
     if (!result?.output) return result;
