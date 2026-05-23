@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-dropdown-switch"
-version = "1.0.2"
+version = "1.0.3"
 description = "A frontend-only ComfyUI node that routes one of several inputs to the output based on a dropdown selection."
 license = { file = "LICENSE" }
 requires-python = ">=3.9"

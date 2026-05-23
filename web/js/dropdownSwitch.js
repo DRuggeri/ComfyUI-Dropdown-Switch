@@ -31,6 +31,29 @@ function getApp() {
   return window.comfyAPI?.app?.app ?? window.app;
 }
 
+// ─── Primitive / widget-input integration ─────────────────────────────────────
+// ComfyUI's Primitive node reads widget config via a private Symbol key (y):
+//   input.widget[y]?.()  →  returns [valuesArray, {}]  →  type = COMBO
+// We discover y by probing the public setWidgetConfig API with a Proxy.
+
+let _widgetConfigGetterSym = null; // cached after first probe
+
+function getWidgetConfigGetterSym() {
+  if (_widgetConfigGetterSym !== null) return _widgetConfigGetterSym;
+  const api = window.comfyAPI?.widgetInputs;
+  if (!api?.setWidgetConfig) return null;
+  let found = null;
+  // Probe: setWidgetConfig does  e.widget[y] = () => t  — intercept the set.
+  const probeInput = {
+    widget: new Proxy({}, {
+      set(_obj, key) { if (typeof key === "symbol") found = key; return true; },
+    }),
+  };
+  api.setWidgetConfig(probeInput, [["probe"], {}]);
+  _widgetConfigGetterSym = found;
+  return found;
+}
+
 // ─── build node class (deferred until LiteGraph is available) ─────────────────
 
 function buildNodeClass(LG) {
@@ -58,6 +81,18 @@ function buildNodeClass(LG) {
       { values: [] }
     );
 
+    // Permanent "choice" input slot.  We point its .widget at the actual combo
+    // widget object so that:
+    //   • ComfyUI's onGraphConfigured hook finds the matching widget by name and
+    //     does NOT auto-remove the input.
+    //   • Primitive.applyToGraph() can write its selected value directly to
+    //     _choiceWidget.value.
+    //   • _applyWidgetConfigGetter() sets the private Symbol-keyed getter so
+    //     Primitive._onFirstConnection reads our labels and becomes a COMBO.
+    this.addInput("choice", "*");
+    this.inputs[0].widget = this._choiceWidget;
+    this._applyWidgetConfigGetter();
+
     // First dynamic input slot
     this._addDynamicInput();
 
@@ -68,7 +103,20 @@ function buildNodeClass(LG) {
 
   // ── input management ───────────────────────────────────────────────────────
 
-  /** Add a new labelled input slot. Label is shown as the slot name. */
+  /**
+   * Set the private Symbol-keyed getter on _choiceWidget so that ComfyUI's
+   * Primitive node calls widget[sym]() and gets [labelsArray, {}], which
+   * causes it to auto-configure as a COMBO dropdown with our labels as options.
+   *
+   * The closure captures `this` (the node) so it always returns the current
+   * this._labels, even if the array is replaced (e.g. during configure).
+   */
+  _applyWidgetConfigGetter() {
+    const sym = getWidgetConfigGetterSym();
+    if (!sym || !this._choiceWidget) return;
+    const node = this;
+    this._choiceWidget[sym] = () => [node._labels, {}];
+  }
   _addDynamicInput(label = "") {
     const idx = this._labels.length;
 
@@ -94,16 +142,15 @@ function buildNodeClass(LG) {
     return idx;
   }
 
-  /** Remove the input at position `idx` and its associated label. */
+  /** Remove the input at position `idx` (label-index) and its associated label. */
   _removeDynamicInput(idx) {
     if (idx < 0 || idx >= this._labels.length) return;
-
-    if (this.inputs[idx]?.link != null) {
-      this.graph?.removeLink(this.inputs[idx].link);
+    const slot = idx + 1; // inputs[0] is the permanent choice slot
+    if (this.inputs[slot]?.link != null) {
+      this.graph?.removeLink(this.inputs[slot].link);
     }
-
     this._labels.splice(idx, 1);
-    this.removeInput(idx);
+    this.removeInput(slot);
     this._syncChoiceValues();
     this._autoSize();
   }
@@ -113,7 +160,8 @@ function buildNodeClass(LG) {
     if (idx < 0 || idx >= this._labels.length) return;
     const label = (newLabel || "").trim() || `input_${idx + 1}`;
     this._labels[idx] = label;
-    if (this.inputs[idx]) this.inputs[idx].name = label;
+    const slot = idx + 1; // inputs[0] is the permanent choice slot
+    if (this.inputs[slot]) this.inputs[slot].name = label;
     this._syncChoiceValues();
   }
 
@@ -145,11 +193,11 @@ function buildNodeClass(LG) {
 
   // ── index helpers ──────────────────────────────────────────────────────────
 
-  /** Index of the currently selected input (0-based). */
+  /** Slot index of the currently selected model input (inputs[0] = choice slot). */
   get selectedIndex() {
     const v = this._choiceWidget.value;
     const i = this._labels.indexOf(v);
-    return i >= 0 ? i : 0;
+    return (i >= 0 ? i : 0) + 1; // +1 because inputs[0] is the choice slot
   }
 
   // ── context menu ──────────────────────────────────────────────────────────
@@ -159,42 +207,42 @@ function buildNodeClass(LG) {
     // Detect which input slot the right-click landed on.
     const mouse = canvas?.graph_mouse;
     const slotH = LG.NODE_SLOT_HEIGHT ?? 20;
-    let hoveredSlot = -1;
+    let hoveredLabelIdx = -1; // 0-based label index (slot = labelIdx + 1)
     if (mouse) {
-      // Exclude the trailing empty slot (always last)
-      for (let i = 0; i < this.inputs.length - 1; i++) {
+      // Skip slot 0 (choice) and the trailing empty model slot (last)
+      for (let i = 1; i < this.inputs.length - 1; i++) {
         const pos = this.getConnectionPos(true, i);
         if (Math.abs(pos[1] - mouse[1]) < slotH * 0.65) {
-          hoveredSlot = i;
+          hoveredLabelIdx = i - 1;
           break;
         }
       }
     }
 
-    if (hoveredSlot >= 0) {
-      const lbl = this._labels[hoveredSlot] ?? `slot ${hoveredSlot}`;
+    if (hoveredLabelIdx >= 0) {
+      const lbl = this._labels[hoveredLabelIdx] ?? `slot ${hoveredLabelIdx}`;
       options.push(
         { content: `✏️ Rename "${lbl}"`,
           callback: () => {
             const newName = prompt(`Rename input "${lbl}" to:`, lbl);
             if (newName !== null) {
-              this._renameInput(hoveredSlot, newName);
+              this._renameInput(hoveredLabelIdx, newName);
               this.setDirtyCanvas(true, true);
             }
           } },
         { content: `📌 Insert above "${lbl}"`,
-          callback: () => this._insertInputAt(hoveredSlot) },
+          callback: () => this._insertInputAt(hoveredLabelIdx) },
       );
-      if (hoveredSlot > 0) {
+      if (hoveredLabelIdx > 0) {
         options.push(
           { content: `↑ Move "${lbl}" up`,
-            callback: () => this._moveInput(hoveredSlot, hoveredSlot - 1) },
+            callback: () => this._moveInput(hoveredLabelIdx, hoveredLabelIdx - 1) },
         );
       }
-      if (hoveredSlot < this.inputs.length - 2) {
+      if (hoveredLabelIdx < this._labels.length - 1) {
         options.push(
           { content: `↓ Move "${lbl}" down`,
-            callback: () => this._moveInput(hoveredSlot, hoveredSlot + 1) },
+            callback: () => this._moveInput(hoveredLabelIdx, hoveredLabelIdx + 1) },
         );
       }
       options.push(null); // separator before global options
@@ -233,25 +281,31 @@ function buildNodeClass(LG) {
 
   // ── input reordering & insertion ──────────────────────────────────────────
 
-  /** Swap two input slots, keeping graph link references consistent. */
-  _moveInput(fromIdx, toIdx) {
-    if (fromIdx === toIdx) return;
-    const len = this.inputs.length;
-    if (fromIdx < 0 || toIdx < 0 || fromIdx >= len || toIdx >= len) return;
+  /**
+   * Swap two model inputs by label-index (0-based).
+   * Actual slot index = labelIdx + 1 because inputs[0] is the choice slot.
+   */
+  _moveInput(fromLabelIdx, toLabelIdx) {
+    if (fromLabelIdx === toLabelIdx) return;
+    if (fromLabelIdx < 0 || toLabelIdx < 0) return;
+    if (fromLabelIdx >= this._labels.length || toLabelIdx >= this._labels.length) return;
+
+    const from = fromLabelIdx + 1;
+    const to   = toLabelIdx   + 1;
 
     // Swap the slot objects (each carries .name, .type, .link)
-    [this.inputs[fromIdx], this.inputs[toIdx]] =
-      [this.inputs[toIdx], this.inputs[fromIdx]];
+    [this.inputs[from], this.inputs[to]] =
+      [this.inputs[to], this.inputs[from]];
 
     // Swap labels
-    [this._labels[fromIdx], this._labels[toIdx]] =
-      [this._labels[toIdx], this._labels[fromIdx]];
+    [this._labels[fromLabelIdx], this._labels[toLabelIdx]] =
+      [this._labels[toLabelIdx], this._labels[fromLabelIdx]];
 
     // Update every graph link that targets this node
     for (const link of Object.values(this.graph?.links ?? {})) {
       if (link.target_id !== this.id) continue;
-      if      (link.target_slot === fromIdx) link.target_slot = toIdx;
-      else if (link.target_slot === toIdx)   link.target_slot = fromIdx;
+      if      (link.target_slot === from) link.target_slot = to;
+      else if (link.target_slot === to)   link.target_slot = from;
     }
 
     // Re-sync combo, preserving the currently selected label by name
@@ -262,23 +316,26 @@ function buildNodeClass(LG) {
     this.setDirtyCanvas(true, true);
   }
 
-  /** Insert a new empty input slot at position i, shifting later slots down. */
-  _insertInputAt(i) {
-    // Find a unique label
+  /**
+   * Insert a new empty model input at label-index i.
+   * Actual slot index = i + 1 because inputs[0] is the choice slot.
+   */
+  _insertInputAt(labelIdx) {
     let n = 1;
     while (this._labels.includes(`input_${n}`)) n++;
     const newName = `input_${n}`;
+    const slot = labelIdx + 1;
 
     // addInput always appends; pop it off the end and splice into position
     this.addInput(newName, "*");
     const newSlot = this.inputs.pop();
-    this.inputs.splice(i, 0, newSlot);
-    this._labels.splice(i, 0, newName);
+    this.inputs.splice(slot, 0, newSlot);
+    this._labels.splice(labelIdx, 0, newName);
 
-    // Slots that were at index >= i are now at index >= i+1
+    // Slots that were at index >= slot are now at index >= slot+1
     for (const link of Object.values(this.graph?.links ?? {})) {
       if (link.target_id !== this.id) continue;
-      if (link.target_slot >= i) link.target_slot++;
+      if (link.target_slot >= slot) link.target_slot++;
     }
 
     const sel = this._choiceWidget?.value;
@@ -295,11 +352,14 @@ function buildNodeClass(LG) {
    * Auto-add a new empty slot whenever the last existing slot gets connected.
    * Also clean up any trailing empty (disconnected) slots beyond one.
    */
-  onConnectionsChange(type, _slotIndex, connected, _link, _ioSlot) {
+  onConnectionsChange(type, slotIndex, _connected, _link, _ioSlot) {
     if (type !== LG.INPUT) return;
-    // Any connection change: ensure there is still a trailing empty slot.
-    // We never auto-remove slots because they may be empty-but-labelled options
-    // the user deliberately added (e.g. 40 model options where only one is wired).
+    // Dim the combo widget while the choice slot (index 0) is connected to a
+    // Primitive — the Primitive drives the selection, not the user's click.
+    if (slotIndex === 0) {
+      this._choiceWidget.disabled = this.inputs[0]?.link != null;
+    }
+    // Ensure a trailing empty model slot always exists.
     this._cleanupInputSlots();
   }
 
@@ -327,7 +387,6 @@ function buildNodeClass(LG) {
     const savedWV     = data.widgets_values;
 
     // Clear all constructor-created state so super.configure starts fresh.
-    // Clear outputs to prevent duplication (super re-adds them from data.outputs).
     while (this.inputs.length > 0) this.removeInput(0);
     this.outputs        = [];
     this.widgets.length = 0;
@@ -344,13 +403,18 @@ function buildNodeClass(LG) {
       { values: [] }
     );
 
-    // Determine labels to restore.
-    // data.labels is saved explicitly by serialize(); fall back to input names.
+    // Re-create the permanent choice input slot.
+    this.addInput("choice", "*");
+    this.inputs[0].widget = this._choiceWidget;
+    this._applyWidgetConfigGetter(); // sets the Symbol-keyed getter for Primitive
+
+    // Determine model labels to restore.
+    // savedInputs[0] is the choice slot — model labels start at savedInputs[1].
     let labels;
     if (data.labels?.length > 0) {
       labels = data.labels;
     } else if (savedInputs?.length > 0) {
-      labels = savedInputs.map(i => i.name);
+      labels = savedInputs.slice(1).map(i => i.name).filter(Boolean);
     }
     const toRestore = labels?.length > 0 ? labels : ["input_1"];
 
@@ -358,13 +422,15 @@ function buildNodeClass(LG) {
       this._addDynamicInput(lbl);
     }
 
-    // Restore link IDs so LiteGraph can reconnect wires when the graph loads.
-    // super.configure was called with inputs:[] so it never set these.
+    // Restore link IDs (including the choice slot at index 0).
     if (savedInputs) {
       for (let i = 0; i < Math.min(savedInputs.length, this.inputs.length); i++) {
         this.inputs[i].link = savedInputs[i]?.link ?? null;
       }
     }
+
+    // Dim combo widget if choice slot is already wired (e.g. Primitive saved).
+    this._choiceWidget.disabled = !!this.inputs[0]?.link;
 
     // widgets_values[0] is the combo value (only widget).
     const desired = savedWV?.[0];
@@ -428,13 +494,39 @@ function patchGraphToPrompt(comfyApp) {
     // input before calling graphToPrompt.  This ensures ComfyUI's serialiser
     // never traverses to those upstream nodes, so their subgraph internals
     // won't appear in result.output and the backend won't execute them.
-    const savedLinks = [];
+    //
+    // If inputs[0] (the choice slot) is wired to a Primitive, we read the
+    // Primitive's current widget value and temporarily override the combo so
+    // that selectedIndex reflects the Primitive's runtime selection.
+    const savedLinks      = [];
+    const choiceOverrides = []; // { node, origValue }
     if (graph) {
       for (const n of graph._nodes ?? []) {
         if (n.type !== NODE_TYPE || !n._choiceWidget) continue;
+
+        // Resolve Primitive value BEFORE reading selectedIndex.
+        const choiceSlot = n.inputs?.[0];
+        if (choiceSlot?.link != null) {
+          const link    = graph.links?.[choiceSlot.link];
+          const srcNode = link ? graph.getNodeById?.(link.origin_id) : null;
+          if (srcNode) {
+            // Primitive stores its value in widgets[0] or on the output widget.
+            const outSlot = srcNode.outputs?.[link.origin_slot];
+            const val = outSlot?.widget?.value
+                     ?? srcNode.widgets?.[0]?.value;
+            if (typeof val === "string" && n._labels.includes(val)) {
+              choiceOverrides.push({ node: n, origValue: n._choiceWidget.value });
+              n._choiceWidget.value = val;
+            }
+          }
+        }
+
         const selIdx = n.selectedIndex;
         for (let i = 0; i < (n.inputs?.length ?? 0); i++) {
           if (i === selIdx) continue;
+          // Never null out the choice slot (index 0) — the Primitive wire must
+          // stay in the serialised workflow so it reloads correctly.
+          if (i === 0) continue;
           const inp = n.inputs[i];
           if (inp?.link != null) {
             savedLinks.push({ inp, link: inp.link });
@@ -451,6 +543,9 @@ function patchGraphToPrompt(comfyApp) {
       // Always restore, even if original() throws.
       for (const { inp, link } of savedLinks) {
         inp.link = link;
+      }
+      for (const { node, origValue } of choiceOverrides) {
+        node._choiceWidget.value = origValue;
       }
     }
 
