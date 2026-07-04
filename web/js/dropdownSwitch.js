@@ -203,6 +203,13 @@ function buildNodeClass(LG) {
   // ── context menu ──────────────────────────────────────────────────────────
 
   getExtraMenuOptions(canvas, options) {
+    const ownGetExtraMenuOptions = this.constructor.prototype.getExtraMenuOptions;
+    const anyBackendClass = Object.values(LG.registered_node_types ?? {}).find(
+      (c) => typeof c.prototype?.getExtraMenuOptions === "function" &&
+             c.prototype.getExtraMenuOptions !== ownGetExtraMenuOptions
+    );
+    anyBackendClass?.prototype.getExtraMenuOptions.call(this, canvas, options);
+
     // ── Slot-specific options (move / insert) ──────────────────────────────
     // Detect which input slot the right-click landed on.
     const mouse = canvas?.graph_mouse;
