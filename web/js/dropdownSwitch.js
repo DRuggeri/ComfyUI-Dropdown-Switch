@@ -252,6 +252,10 @@ function buildNodeClass(LG) {
             callback: () => this._moveInput(hoveredLabelIdx, hoveredLabelIdx + 1) },
         );
       }
+      options.push(
+        { content: `🗑 Remove "${lbl}"`,
+          callback: () => this._removeDynamicInput(hoveredLabelIdx) },
+      );
       options.push(null); // separator before global options
     }
 
