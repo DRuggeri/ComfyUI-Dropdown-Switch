@@ -71,6 +71,7 @@ function buildNodeClass(LG) {
      this.bgcolor           = "#1e2a1e";
 
      this._labels = [];
+     this._pendingChoiceValue = undefined;
 
      // Combo at top – the only widget
      this._choiceWidget = this.addWidget(
@@ -174,7 +175,7 @@ function buildNodeClass(LG) {
    }
 
    /** Push current labels into the choice widget and keep selection valid. */
-   _syncChoiceValues() {
+   _syncChoiceValues({ preserveEmpty = false } = {}) {
      if (!this._choiceWidget) return; // widget not yet created (e.g. during constructor)
      const values  = [...this._labels];
      const current = this._choiceWidget.value;
@@ -194,8 +195,62 @@ function buildNodeClass(LG) {
        return;
      }
 
+     if (preserveEmpty && (current == null || current === "")) {
+       this._choiceWidget.value = "";
+       return;
+     }
+
      // Keep existing selection if still present, else default to first
      this._choiceWidget.value = values.includes(current) ? current : values[0];
+   }
+
+   _normalizeChoiceValue(value) {
+     if (typeof value === "number" &&
+         Number.isInteger(value) &&
+         value >= 0 &&
+         value < this._labels.length) {
+       return this._labels[value];
+     }
+     if (typeof value === "string" && this._labels.includes(value)) {
+       return value;
+     }
+     return null;
+   }
+
+   _getPrimitiveChoiceValue() {
+     const choiceSlot = this.inputs?.[0];
+     if (choiceSlot?.link == null || !this.graph) return null;
+     const link = this.graph.links?.[choiceSlot.link];
+     if (!link) return null;
+     const srcNode = this.graph.getNodeById?.(link.origin_id);
+     if (!srcNode) return null;
+     const outSlot = srcNode.outputs?.[link.origin_slot];
+     return this._normalizeChoiceValue(
+       outSlot?.widget?.value ?? srcNode.widgets?.[0]?.value
+     );
+   }
+
+   _finalizeConfiguredState() {
+     if (!this._choiceWidget) return;
+
+     const hasLinkedChoice = this.inputs?.[0]?.link != null;
+     const primitiveChoice = this._getPrimitiveChoiceValue();
+
+     if (hasLinkedChoice && primitiveChoice == null) {
+       this._choiceWidget.value = "";
+     }
+
+     this._syncChoiceValues({ preserveEmpty: hasLinkedChoice && primitiveChoice == null });
+
+     const desired = primitiveChoice
+                  ?? (!hasLinkedChoice ? this._normalizeChoiceValue(this._pendingChoiceValue) : null);
+
+     if (desired != null) {
+       this._choiceWidget.value = desired;
+     }
+
+     this._choiceWidget.disabled = false;
+     this._autoSize();
    }
 
    _onChoiceChanged(_value) {
@@ -219,21 +274,10 @@ function buildNodeClass(LG) {
      // widget (outside the node) holds the user's selected value, but our internal
      // _choiceWidget.value is stale and not updated in real-time. We must read the
      // Primitive's actual widget value directly from the linked node.
-     const choiceSlot = this.inputs?.[0];
-     if (choiceSlot?.link != null && this.graph) {
-       const link = this.graph.links?.[choiceSlot.link];
-       if (link) {
-         const srcNode = this.graph.getNodeById?.(link.origin_id);
-         if (srcNode) {
-           // Primitive stores value in widget on output slot, or in widgets[0]
-           const outSlot = srcNode.outputs?.[link.origin_slot];
-           const primitiveVal = outSlot?.widget?.value ?? srcNode.widgets?.[0]?.value;
-           if (typeof primitiveVal === "string" && primitiveVal !== "") {
-             // Use Primitive's value instead of stale internal widget value
-             v = primitiveVal;
-           }
-         }
-       }
+     const primitiveVal = this._getPrimitiveChoiceValue();
+     if (primitiveVal != null) {
+       // Use Primitive's value instead of stale internal widget value
+       v = primitiveVal;
      }
 
      let i = -1;
@@ -469,6 +513,7 @@ function buildNodeClass(LG) {
      this.widgets.length = 0;
      this._labels        = [];
      this._choiceWidget  = null;
+     this._pendingChoiceValue = savedWV?.[0];
 
      // Restore position, size, id, outputs, properties, etc.
      super.configure({ ...data, inputs: [], widgets_values: [] });
@@ -490,15 +535,19 @@ function buildNodeClass(LG) {
 
      // Determine model labels to restore.
      // savedInputs[0] is the choice slot — model labels start at savedInputs[1].
-     let labels;
-     if (data.labels?.length > 0) {
-       labels = data.labels;
-     } else if (savedInputs?.length > 0) {
-       labels = savedInputs.slice(1).map(i => i.name).filter(Boolean);
-     }
-     const toRestore = labels?.length > 0 ? labels : ["input_1"];
+     const serializedLabels = Array.isArray(data.labels) ? data.labels : [];
+     const savedInputLabels = Array.isArray(savedInputs)
+       ? savedInputs.slice(1).map((input, idx) => {
+           const name = input?.name;
+           return (typeof name === "string" && name.trim()) ? name : `input_${idx + 1}`;
+         })
+       : [];
+     const labelCount = Math.max(serializedLabels.length, savedInputLabels.length, 1);
 
-     for (const lbl of toRestore) {
+     for (let i = 0; i < labelCount; i++) {
+       const lbl = (typeof serializedLabels[i] === "string" && serializedLabels[i].trim())
+         ? serializedLabels[i].trim()
+         : savedInputLabels[i] ?? `input_${i + 1}`;
        this._addDynamicInput(lbl);
      }
 
@@ -512,24 +561,14 @@ function buildNodeClass(LG) {
        }
      }
 
-     // Never force-disable the choice widget solely due to link presence.
-     if (this._choiceWidget) {
-       this._choiceWidget.disabled = false;
-     }
+     // Final normalization after options are present. If the choice input is
+     // linked, keep the combo unresolved here so Primitive can drive it once
+     // graph links are fully restored in onGraphConfigured.
+     this._finalizeConfiguredState();
+   }
 
-     // widgets_values[0] is the combo value (only widget).
-     // Accept either label-string or numeric index (0-based).
-     const desired = savedWV?.[0];
-     if (typeof desired === "number" && Number.isInteger(desired) && desired >= 0 && desired < this._labels.length) {
-       this._choiceWidget.value = this._labels[desired];
-     } else if (desired != null && this._labels.includes(desired)) {
-       this._choiceWidget.value = desired;
-     }
-
-     // Final normalization after options are present.
-     this._syncChoiceValues();
-
-     this._autoSize();
+   onGraphConfigured() {
+     this._finalizeConfiguredState();
    }
 
    // ── Nodes 2.0 virtual resolution ────────────────────────────────────────
@@ -846,9 +885,10 @@ app.registerExtension({
       if (comfyApp.graph) {
         for (const node of comfyApp.graph._nodes || []) {
           if (node.type === NODE_TYPE && node._choiceWidget && node._labels) {
-            // Force sync the widget options with labels in case Nodes 2.0
-            // deserialization didn't populate them correctly
-            node._syncChoiceValues();
+            // Re-run the same post-config restore logic after Nodes 2.0 finishes
+            // its app-level graph setup so labels and Primitive-driven choices
+            // stay in sync even when serialized data is incomplete.
+            node._finalizeConfiguredState?.();
           }
         }
       }
