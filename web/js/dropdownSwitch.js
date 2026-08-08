@@ -199,7 +199,7 @@ function buildNodeClass(LG) {
     this.size[1] = s[1];
   }
 
-  // ── index helpers ─────────────────────────────────────────────────────────
+  // ── index helpers ───────────────────────────────────────────────────────��─
 
   /** Slot index of the currently selected model input (inputs[0] = choice slot). */
   get selectedIndex() {
@@ -382,11 +382,10 @@ function buildNodeClass(LG) {
    */
   onConnectionsChange(type, slotIndex, _connected, _link, _ioSlot) {
     if (type !== LG.INPUT) return;
-    // Dim the combo widget while the choice slot (index 0) is connected to a
-    // Primitive — the Primitive drives the selection, not the user's click.
-    if (slotIndex === 0) {
-      this._choiceWidget.disabled = this.inputs[0]?.link != null;
-    }
+    // NOTE: do NOT disable the choice widget simply because choice slot (0) is linked.
+    // In Nodes 2.0 / App mode, promoted subgraph inputs may present as linked/proxied,
+    // and disabling here makes the UI permanently non-interactive.
+    // Runtime selection for primitive-driven cases is still handled in graphToPrompt.
     // Ensure a trailing empty model slot always exists.
     this._cleanupInputSlots();
   }
@@ -457,8 +456,8 @@ function buildNodeClass(LG) {
       }
     }
 
-    // Dim combo widget if choice slot is already wired (e.g. Primitive saved).
-    this._choiceWidget.disabled = !!this.inputs[0]?.link;
+    // Never force-disable the choice widget solely due to link presence.
+    this._choiceWidget.disabled = false;
 
     // widgets_values[0] is the combo value (only widget).
     // Accept either label-string or numeric index (0-based).
@@ -583,7 +582,7 @@ function patchGraphToPrompt(comfyApp) {
       }
     }
 
-    // ── Restore full workflow in the result ──────────────────────────────────
+    // ── Restore full workflow in the result ────────────���─────────────────────
     // original() serialised the graph with our nulled links, so result.workflow
     // would have only the selected link.  Replace it with the pre-captured full
     // state so that ComfyUI saves (history, auto-save, Ctrl+S) preserve all
@@ -746,7 +745,7 @@ function patchGraphToPrompt(comfyApp) {
   };
 }
 
-// ─── extension registration ───────────────────────────────────────────────────
+// ─── extension registration ────────────────────────────────────��──────────────
 
 app.registerExtension({
   name: "DropdownSwitch.Extension",
