@@ -212,7 +212,30 @@ function buildNodeClass(LG) {
 
    /** Slot index of the currently selected model input (inputs[0] = choice slot). */
    get selectedIndex() {
-     const v = this._choiceWidget.value;
+     let v = this._choiceWidget.value;
+
+     // CRITICAL FIX for Nodes 2.0 promoted widgets:
+     // When the choice widget is promoted to a Primitive in Nodes 2.0, the Primitive
+     // widget (outside the node) holds the user's selected value, but our internal
+     // _choiceWidget.value is stale and not updated in real-time. We must read the
+     // Primitive's actual widget value directly from the linked node.
+     const choiceSlot = this.inputs?.[0];
+     if (choiceSlot?.link != null && this.graph) {
+       const link = this.graph.links?.[choiceSlot.link];
+       if (link) {
+         const srcNode = this.graph.getNodeById?.(link.origin_id);
+         if (srcNode) {
+           // Primitive stores value in widget on output slot, or in widgets[0]
+           const outSlot = srcNode.outputs?.[link.origin_slot];
+           const primitiveVal = outSlot?.widget?.value ?? srcNode.widgets?.[0]?.value;
+           if (typeof primitiveVal === "string" && primitiveVal !== "") {
+             // Use Primitive's value instead of stale internal widget value
+             v = primitiveVal;
+           }
+         }
+       }
+     }
+
      let i = -1;
 
      // Nodes 2.0 may pass numeric indices transiently during configure/promotion.
