@@ -117,7 +117,6 @@ function buildNodeClass(LG) {
      const node = this;
      this._choiceWidget[sym] = () => [node._labels, {}];
    }
-
    _addDynamicInput(label = "") {
      const idx = this._labels.length;
 
@@ -138,9 +137,7 @@ function buildNodeClass(LG) {
      }
      this._labels.push(iName);
      this.addInput(iName, "*");
-     
-     // CRITICAL: Immediately update widget options so Nodes 2.0 sees the new label
-     this._updateWidgetOptions();
+     this._syncChoiceValues();
      this._autoSize();
      return idx;
    }
@@ -158,7 +155,7 @@ function buildNodeClass(LG) {
      }
      this._labels.splice(idx, 1);
      this.removeInput(slot);
-     this._updateWidgetOptions();
+     this._syncChoiceValues();
      this._autoSize();
    }
 
@@ -173,39 +170,32 @@ function buildNodeClass(LG) {
      const slot = idx + 1; // inputs[0] is the permanent choice slot
      // Guard: validate slot exists before modifying
      if (this.inputs?.[slot]) this.inputs[slot].name = label;
-     this._updateWidgetOptions();
+     this._syncChoiceValues();
    }
 
-   /**
-    * Update the combo widget's options array to match current labels.
-    * CRITICAL for Nodes 2.0: This ensures the dropdown always shows all labels.
-    */
-   _updateWidgetOptions() {
-     if (!this._choiceWidget) return;
-     
-     const values = [...this._labels];
-     this._choiceWidget.options.values = values;
-     
-     // Ensure the current selection is valid
+   /** Push current labels into the choice widget and keep selection valid. */
+   _syncChoiceValues() {
+     if (!this._choiceWidget) return; // widget not yet created (e.g. during constructor)
+     const values  = [...this._labels];
      const current = this._choiceWidget.value;
-     
+
+     this._choiceWidget.options.values = values;
+
      if (values.length === 0) {
        this._choiceWidget.value = "";
        return;
      }
-     
-     // If current value is still valid, keep it
-     if (typeof current === "string" && values.includes(current)) {
-       return; // Value is still good
-     }
-     
-     // If current value is numeric index, validate it
+
+     // Accept both label-string and numeric index forms (Nodes 2.0/App mode can
+     // transiently provide combo values as indices during configure/rehydration).
+     // Guard: validate numeric index is within bounds
      if (typeof current === "number" && Number.isInteger(current) && current >= 0 && current < values.length) {
-       return; // Index is still valid
+       this._choiceWidget.value = values[current];
+       return;
      }
-     
-     // Current value is invalid — default to first label
-     this._choiceWidget.value = values[0];
+
+     // Keep existing selection if still present, else default to first
+     this._choiceWidget.value = values.includes(current) ? current : values[0];
    }
 
    _onChoiceChanged(_value) {
@@ -352,7 +342,7 @@ function buildNodeClass(LG) {
      );
    }
 
-   // ── input reordering & insertion ────────────────────────────────────���─────
+   // ── input reordering & insertion ──────────────────────────────────────────
 
    /**
     * Swap two model inputs by label-index (0-based).
@@ -391,7 +381,7 @@ function buildNodeClass(LG) {
 
      // Re-sync combo, preserving the currently selected label by name
      const sel = this._choiceWidget?.value;
-     this._updateWidgetOptions();
+     this._syncChoiceValues();
      if (sel != null && this._labels.includes(sel)) this._choiceWidget.value = sel;
 
      this.setDirtyCanvas(true, true);
@@ -427,7 +417,7 @@ function buildNodeClass(LG) {
      }
 
      const sel = this._choiceWidget?.value;
-     this._updateWidgetOptions();
+     this._syncChoiceValues();
      if (sel != null && this._labels.includes(sel)) this._choiceWidget.value = sel;
 
      this._autoSize();
@@ -537,8 +527,7 @@ function buildNodeClass(LG) {
      }
 
      // Final normalization after options are present.
-     // CRITICAL: This ensures widget.options.values is synced with _labels for Nodes 2.0
-     this._updateWidgetOptions();
+     this._syncChoiceValues();
 
      this._autoSize();
    }
@@ -841,6 +830,29 @@ app.registerExtension({
 
     // Patch graphToPrompt so virtual node links are resolved before execution.
     patchGraphToPrompt(comfyApp);
+
+    // CRITICAL FIX FOR NODES 2.0:
+    // Nodes 2.0 has its own serialization system separate from LiteGraph.
+    // We need to intercept onGraphConfigured to restore labels when a workflow
+    // is loaded in Nodes 2.0 mode. This is called before the graph renders.
+    const originalOnGraphConfigured = comfyApp.onGraphConfigured;
+    comfyApp.onGraphConfigured = async function(...args) {
+      if (originalOnGraphConfigured) {
+        await originalOnGraphConfigured.apply(this, args);
+      }
+      
+      // After graph is configured in Nodes 2.0, ensure all DropdownSwitch nodes
+      // have their labels properly restored.
+      if (comfyApp.graph) {
+        for (const node of comfyApp.graph._nodes || []) {
+          if (node.type === NODE_TYPE && node._choiceWidget && node._labels) {
+            // Force sync the widget options with labels in case Nodes 2.0
+            // deserialization didn't populate them correctly
+            node._syncChoiceValues();
+          }
+        }
+      }
+    };
 
     // Also make the node available via Nodes 2.0 registration if the API exists.
     if (typeof comfyApp.registerNodeDef === "function") {
