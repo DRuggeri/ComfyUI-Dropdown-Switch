@@ -117,6 +117,7 @@ function buildNodeClass(LG) {
      const node = this;
      this._choiceWidget[sym] = () => [node._labels, {}];
    }
+
    _addDynamicInput(label = "") {
      const idx = this._labels.length;
 
@@ -137,7 +138,9 @@ function buildNodeClass(LG) {
      }
      this._labels.push(iName);
      this.addInput(iName, "*");
-     this._syncChoiceValues();
+     
+     // CRITICAL: Immediately update widget options so Nodes 2.0 sees the new label
+     this._updateWidgetOptions();
      this._autoSize();
      return idx;
    }
@@ -155,7 +158,7 @@ function buildNodeClass(LG) {
      }
      this._labels.splice(idx, 1);
      this.removeInput(slot);
-     this._syncChoiceValues();
+     this._updateWidgetOptions();
      this._autoSize();
    }
 
@@ -170,32 +173,39 @@ function buildNodeClass(LG) {
      const slot = idx + 1; // inputs[0] is the permanent choice slot
      // Guard: validate slot exists before modifying
      if (this.inputs?.[slot]) this.inputs[slot].name = label;
-     this._syncChoiceValues();
+     this._updateWidgetOptions();
    }
 
-   /** Push current labels into the choice widget and keep selection valid. */
-   _syncChoiceValues() {
-     if (!this._choiceWidget) return; // widget not yet created (e.g. during constructor)
-     const values  = [...this._labels];
-     const current = this._choiceWidget.value;
-
+   /**
+    * Update the combo widget's options array to match current labels.
+    * CRITICAL for Nodes 2.0: This ensures the dropdown always shows all labels.
+    */
+   _updateWidgetOptions() {
+     if (!this._choiceWidget) return;
+     
+     const values = [...this._labels];
      this._choiceWidget.options.values = values;
-
+     
+     // Ensure the current selection is valid
+     const current = this._choiceWidget.value;
+     
      if (values.length === 0) {
        this._choiceWidget.value = "";
        return;
      }
-
-     // Accept both label-string and numeric index forms (Nodes 2.0/App mode can
-     // transiently provide combo values as indices during configure/rehydration).
-     // Guard: validate numeric index is within bounds
-     if (typeof current === "number" && Number.isInteger(current) && current >= 0 && current < values.length) {
-       this._choiceWidget.value = values[current];
-       return;
+     
+     // If current value is still valid, keep it
+     if (typeof current === "string" && values.includes(current)) {
+       return; // Value is still good
      }
-
-     // Keep existing selection if still present, else default to first
-     this._choiceWidget.value = values.includes(current) ? current : values[0];
+     
+     // If current value is numeric index, validate it
+     if (typeof current === "number" && Number.isInteger(current) && current >= 0 && current < values.length) {
+       return; // Index is still valid
+     }
+     
+     // Current value is invalid — default to first label
+     this._choiceWidget.value = values[0];
    }
 
    _onChoiceChanged(_value) {
@@ -342,7 +352,7 @@ function buildNodeClass(LG) {
      );
    }
 
-   // ── input reordering & insertion ──────────────────────────────────────────
+   // ── input reordering & insertion ────────────────────────────────────���─────
 
    /**
     * Swap two model inputs by label-index (0-based).
@@ -381,7 +391,7 @@ function buildNodeClass(LG) {
 
      // Re-sync combo, preserving the currently selected label by name
      const sel = this._choiceWidget?.value;
-     this._syncChoiceValues();
+     this._updateWidgetOptions();
      if (sel != null && this._labels.includes(sel)) this._choiceWidget.value = sel;
 
      this.setDirtyCanvas(true, true);
@@ -417,7 +427,7 @@ function buildNodeClass(LG) {
      }
 
      const sel = this._choiceWidget?.value;
-     this._syncChoiceValues();
+     this._updateWidgetOptions();
      if (sel != null && this._labels.includes(sel)) this._choiceWidget.value = sel;
 
      this._autoSize();
@@ -527,7 +537,8 @@ function buildNodeClass(LG) {
      }
 
      // Final normalization after options are present.
-     this._syncChoiceValues();
+     // CRITICAL: This ensures widget.options.values is synced with _labels for Nodes 2.0
+     this._updateWidgetOptions();
 
      this._autoSize();
    }
