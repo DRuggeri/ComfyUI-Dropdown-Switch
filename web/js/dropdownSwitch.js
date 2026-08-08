@@ -18,7 +18,7 @@ import { app } from "../../../scripts/app.js";
 const NODE_TYPE = "DropdownSwitch";
 const CATEGORY  = "utils";
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+// ─── helpers ──────────────────────────────────────────────────────────
 
 function getLG() {
   return window.LiteGraph ?? globalThis.LiteGraph;
@@ -177,6 +177,14 @@ function buildNodeClass(LG) {
       this._choiceWidget.value = "";
       return;
     }
+
+    // Accept both label-string and numeric index forms (Nodes 2.0/App mode can
+    // transiently provide combo values as indices during configure/rehydration).
+    if (typeof current === "number" && Number.isInteger(current)) {
+      this._choiceWidget.value = values[current] ?? values[0];
+      return;
+    }
+
     // Keep existing selection if still present, else default to first
     this._choiceWidget.value = values.includes(current) ? current : values[0];
   }
@@ -191,16 +199,25 @@ function buildNodeClass(LG) {
     this.size[1] = s[1];
   }
 
-  // ── index helpers ──────────────────────────────────────────────────────────
+  // ── index helpers ─────────────────────────────────────────────────────────
 
   /** Slot index of the currently selected model input (inputs[0] = choice slot). */
   get selectedIndex() {
     const v = this._choiceWidget.value;
-    const i = this._labels.indexOf(v);
-    return (i >= 0 ? i : 0) + 1; // +1 because inputs[0] is the choice slot
+    let i = -1;
+
+    if (typeof v === "number" && Number.isInteger(v)) {
+      i = v;
+    } else {
+      i = this._labels.indexOf(v);
+    }
+
+    // Clamp to a valid model-label index, then +1 (inputs[0] is the choice slot)
+    const safe = (i >= 0 && i < this._labels.length) ? i : 0;
+    return safe + 1;
   }
 
-  // ── context menu ──────────────────────────────────────────────────────────
+  // ── context menu ───────────────────────────────────────────────────────────
 
   getExtraMenuOptions(canvas, options) {
     const ownGetExtraMenuOptions = this.constructor.prototype.getExtraMenuOptions;
@@ -444,10 +461,16 @@ function buildNodeClass(LG) {
     this._choiceWidget.disabled = !!this.inputs[0]?.link;
 
     // widgets_values[0] is the combo value (only widget).
+    // Accept either label-string or numeric index (0-based).
     const desired = savedWV?.[0];
-    if (desired && this._labels.includes(desired)) {
+    if (typeof desired === "number" && Number.isInteger(desired)) {
+      this._choiceWidget.value = this._labels[desired] ?? this._labels[0] ?? "";
+    } else if (desired != null && this._labels.includes(desired)) {
       this._choiceWidget.value = desired;
     }
+
+    // Final normalization after options are present.
+    this._syncChoiceValues();
 
     this._autoSize();
   }
@@ -479,7 +502,7 @@ function buildNodeClass(LG) {
     return { node: srcNode, slot: link.origin_slot };
   }
 
-  // ── drawing ───────────────────────────────────────────────────────────────
+  // ── drawing ────────────────────────────────────────────────────────────
 
   } // end class DropdownSwitchNode
 
