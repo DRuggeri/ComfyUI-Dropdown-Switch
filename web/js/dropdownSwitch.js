@@ -365,13 +365,38 @@ function buildNodeClass(LG) {
    */
   onConnectionsChange(type, slotIndex, _connected, _link, _ioSlot) {
     if (type !== LG.INPUT) return;
-    // Dim the combo widget while the choice slot (index 0) is connected to a
-    // Primitive — the Primitive drives the selection, not the user's click.
+    // Dim the combo widget only when driven by a real upstream node (e.g. a
+    // Primitive).  A subgraph promotion also puts a link on inputs[0], but the
+    // subgraph InputNode is NOT a regular LGraphNode and is therefore not
+    // returned by graph.getNodeById() — we use that as the discriminator so
+    // the widget stays interactive in app-mode / promoted-widget scenarios.
     if (slotIndex === 0) {
-      this._choiceWidget.disabled = this.inputs[0]?.link != null;
+      const originNode = _link
+        ? this.graph?.getNodeById?.(_link.origin_id)
+        : null;
+      this._choiceWidget.disabled =
+        this.inputs[0]?.link != null && originNode != null;
     }
     // Ensure a trailing empty model slot always exists.
     this._cleanupInputSlots();
+  }
+
+  // Override LGraphNode.updateComputedDisabled so that the choice widget is
+  // NOT auto-disabled just because inputs[0] carries a link (which happens
+  // with subgraph promotion as well as Primitive connections).  Instead we
+  // rely solely on widget.disabled, which onConnectionsChange sets only for
+  // real upstream-node (Primitive) connections.
+  updateComputedDisabled() {
+    if (!this.widgets) return;
+    for (const w of this.widgets) {
+      if (w === this._choiceWidget) {
+        // Controlled explicitly via w.disabled; ignore the slot-link heuristic.
+        w.computedDisabled = w.disabled === true;
+      } else {
+        w.computedDisabled =
+          w.disabled || !!(this.getSlotFromWidget?.(w)?.link);
+      }
+    }
   }
 
   _cleanupInputSlots() {
@@ -440,8 +465,22 @@ function buildNodeClass(LG) {
       }
     }
 
-    // Dim combo widget if choice slot is already wired (e.g. Primitive saved).
-    this._choiceWidget.disabled = !!this.inputs[0]?.link;
+    // Disable combo widget only when the choice slot is wired to a real
+    // upstream node (e.g. a saved Primitive).  Subgraph promotion links also
+    // populate inputs[0].link, but their origin node is a special InputNode
+    // that graph.getNodeById() does NOT return — use that to discriminate.
+    {
+      const choiceLinkId = this.inputs[0]?.link;
+      let isPrimitiveDriven = false;
+      if (choiceLinkId != null && this.graph) {
+        const link = this.graph._links?.get?.(choiceLinkId);
+        const originNode = link
+          ? this.graph.getNodeById?.(link.origin_id)
+          : null;
+        isPrimitiveDriven = originNode != null;
+      }
+      this._choiceWidget.disabled = isPrimitiveDriven;
+    }
 
     // widgets_values[0] is the combo value (only widget).
     const desired = savedWV?.[0];
