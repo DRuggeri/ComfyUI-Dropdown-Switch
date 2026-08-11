@@ -551,39 +551,86 @@ function patchGraphToPrompt(comfyApp) {
     const savedLinks      = [];
     const choiceOverrides = []; // { node, origValue }
     if (graph) {
-      for (const n of graph._nodes ?? []) {
-        if (n.type !== NODE_TYPE || !n._choiceWidget) continue;
+      // Recursively walk a graph and any subgraphs it contains.
+      // outerNode is the SubgraphNode in the parent graph (null at root level).
+      const walkGraph = (g, outerNode) => {
+        for (const n of g._nodes ?? []) {
+          if (n.type === NODE_TYPE && n._choiceWidget) {
+            // ── Resolve the current "choice" value ──────────────────────────
+            // Priority 1: real upstream node (e.g. Primitive) on inputs[0].
+            // Priority 2: promoted subgraph input → read from outer SubgraphNode.
+            // Priority 3: keep whatever _choiceWidget.value already holds.
+            const choiceSlot = n.inputs?.[0];
+            if (choiceSlot?.link != null) {
+              const link = g._links?.get?.(choiceSlot.link)
+                        ?? g.links?.[choiceSlot.link];
+              const srcNode = link ? g.getNodeById?.(link.origin_id) : null;
+              if (srcNode) {
+                // Primitive or other real upstream node drives the choice.
+                const outSlot = srcNode.outputs?.[link.origin_slot];
+                const val = outSlot?.widget?.value
+                         ?? srcNode.widgets?.[0]?.value;
+                if (typeof val === "string" && n._labels.includes(val)) {
+                  choiceOverrides.push({ node: n, origValue: n._choiceWidget.value });
+                  n._choiceWidget.value = val;
+                }
+              } else if (outerNode) {
+                // SubgraphInputNode: get the authoritative value from the outer
+                // SubgraphNode so that resolveVirtualOutput uses the right slot.
+                const outerSlotIdx = link?.origin_slot ?? 0;
+                const outerInput   = outerNode.inputs?.[outerSlotIdx];
+                if (outerInput) {
+                  let val = null;
+                  if (outerInput.link != null) {
+                    // Outer input is itself connected to an upstream node.
+                    const og        = outerNode.graph;
+                    const outerLink = og?._links?.get?.(outerInput.link)
+                                   ?? og?.links?.[outerInput.link];
+                    const outerSrc  = outerLink
+                      ? og?.getNodeById?.(outerLink.origin_id)
+                      : null;
+                    if (outerSrc) {
+                      const os = outerSrc.outputs?.[outerLink.origin_slot];
+                      val = os?.widget?.value ?? outerSrc.widgets?.[0]?.value ?? null;
+                    }
+                  } else {
+                    // Outer input is a standalone promoted widget — read its value.
+                    const wName = outerInput.widget?.name ?? outerInput.name ?? "choice";
+                    const ow    = outerNode.widgets?.find(w => w.name === wName);
+                    val = ow?.value ?? null;
+                  }
+                  if (typeof val === "string" && n._labels.includes(val)) {
+                    choiceOverrides.push({ node: n, origValue: n._choiceWidget.value });
+                    n._choiceWidget.value = val;
+                  }
+                }
+              }
+            }
 
-        // Resolve Primitive value BEFORE reading selectedIndex.
-        const choiceSlot = n.inputs?.[0];
-        if (choiceSlot?.link != null) {
-          const link    = graph.links?.[choiceSlot.link];
-          const srcNode = link ? graph.getNodeById?.(link.origin_id) : null;
-          if (srcNode) {
-            // Primitive stores its value in widgets[0] or on the output widget.
-            const outSlot = srcNode.outputs?.[link.origin_slot];
-            const val = outSlot?.widget?.value
-                     ?? srcNode.widgets?.[0]?.value;
-            if (typeof val === "string" && n._labels.includes(val)) {
-              choiceOverrides.push({ node: n, origValue: n._choiceWidget.value });
-              n._choiceWidget.value = val;
+            // ── Null out unselected input links ──────────────────────────────
+            const selIdx = n.selectedIndex;
+            for (let i = 0; i < (n.inputs?.length ?? 0); i++) {
+              if (i === selIdx) continue;
+              // Never null out the choice slot (index 0) — the Primitive /
+              // SubgraphInput wire must stay in the serialised workflow so it
+              // reloads correctly.
+              if (i === 0) continue;
+              const inp = n.inputs[i];
+              if (inp?.link != null) {
+                savedLinks.push({ inp, link: inp.link });
+                inp.link = null;
+              }
             }
           }
-        }
 
-        const selIdx = n.selectedIndex;
-        for (let i = 0; i < (n.inputs?.length ?? 0); i++) {
-          if (i === selIdx) continue;
-          // Never null out the choice slot (index 0) — the Primitive wire must
-          // stay in the serialised workflow so it reloads correctly.
-          if (i === 0) continue;
-          const inp = n.inputs[i];
-          if (inp?.link != null) {
-            savedLinks.push({ inp, link: inp.link });
-            inp.link = null;
+          // ── Recurse into subgraph nodes ────────────────────────────────────
+          if (typeof n.isSubgraphNode === "function" && n.isSubgraphNode?.() && n.subgraph) {
+            walkGraph(n.subgraph, n);
           }
         }
-      }
+      };
+
+      walkGraph(graph, null);
     }
 
     let result;
