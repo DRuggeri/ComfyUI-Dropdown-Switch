@@ -31,6 +31,16 @@ function getApp() {
   return window.comfyAPI?.app?.app ?? window.app;
 }
 
+function getGraphLink(graph, linkId) {
+  const links = graph?._links ?? graph?.links;
+  return links?.get?.(linkId) ?? links?.[linkId];
+}
+
+function getGraphLinks(graph) {
+  const links = graph?._links ?? graph?.links;
+  return links instanceof Map ? [...links.values()] : Object.values(links ?? {});
+}
+
 // ─── Primitive / widget-input integration ─────────────────────────────────────
 // ComfyUI's Primitive node reads widget config via a private Symbol key (y):
 //   input.widget[y]?.()  →  returns [valuesArray, {}]  →  type = COMBO
@@ -313,7 +323,7 @@ function buildNodeClass(LG) {
       [this._labels[toLabelIdx], this._labels[fromLabelIdx]];
 
     // Update every graph link that targets this node
-    for (const link of Object.values(this.graph?.links ?? {})) {
+    for (const link of getGraphLinks(this.graph)) {
       if (link.target_id !== this.id) continue;
       if      (link.target_slot === from) link.target_slot = to;
       else if (link.target_slot === to)   link.target_slot = from;
@@ -344,7 +354,7 @@ function buildNodeClass(LG) {
     this._labels.splice(labelIdx, 0, newName);
 
     // Slots that were at index >= slot are now at index >= slot+1
-    for (const link of Object.values(this.graph?.links ?? {})) {
+    for (const link of getGraphLinks(this.graph)) {
       if (link.target_id !== this.id) continue;
       if (link.target_slot >= slot) link.target_slot++;
     }
@@ -419,71 +429,35 @@ function buildNodeClass(LG) {
   }
 
   configure(data) {
-    const savedInputs = data.inputs;
-    const savedWV     = data.widgets_values;
+    super.configure(data);
 
-    // Clear all constructor-created state so super.configure starts fresh.
-    while (this.inputs.length > 0) this.removeInput(0);
-    this.outputs        = [];
-    this.widgets.length = 0;
-    this._labels        = [];
-    this._choiceWidget  = null;
+    this._choiceWidget = this.widgets?.find(w => w.name === "choice") ?? this._choiceWidget;
+    if (!this._choiceWidget) {
+      this._choiceWidget = this.addWidget(
+        "combo", "choice", "",
+        (v) => this._onChoiceChanged(v),
+        { values: [] }
+      );
+    }
+    if (!this.inputs?.length) this.addInput("choice", "*");
 
-    // Restore position, size, id, outputs, properties, etc.
-    super.configure({ ...data, inputs: [], widgets_values: [] });
-
-    // Re-create combo widget at top.
-    this._choiceWidget = this.addWidget(
-      "combo", "choice", "",
-      (v) => this._onChoiceChanged(v),
-      { values: [] }
-    );
-
-    // Re-create the permanent choice input slot.
-    this.addInput("choice", "*");
+    // Keep configured slot instances intact: modern LiteGraph stores link and
+    // promoted-widget state on the input object itself.
     this.inputs[0].widget = this._choiceWidget;
-    this._applyWidgetConfigGetter(); // sets the Symbol-keyed getter for Primitive
+    this._labels = data.labels?.length
+      ? [...data.labels]
+      : this.inputs.slice(1).map(input => input.name).filter(Boolean);
+    if (this._labels.length === 0) this._addDynamicInput("input_1");
+    this._applyWidgetConfigGetter();
+    this._syncChoiceValues();
 
-    // Determine model labels to restore.
-    // savedInputs[0] is the choice slot — model labels start at savedInputs[1].
-    let labels;
-    if (data.labels?.length > 0) {
-      labels = data.labels;
-    } else if (savedInputs?.length > 0) {
-      labels = savedInputs.slice(1).map(i => i.name).filter(Boolean);
-    }
-    const toRestore = labels?.length > 0 ? labels : ["input_1"];
+    const choiceLink = getGraphLink(this.graph, this.inputs[0]?.link);
+    const originNode = choiceLink
+      ? this.graph?.getNodeById?.(choiceLink.origin_id)
+      : null;
+    this._choiceWidget.disabled = originNode != null;
 
-    for (const lbl of toRestore) {
-      this._addDynamicInput(lbl);
-    }
-
-    // Restore link IDs (including the choice slot at index 0).
-    if (savedInputs) {
-      for (let i = 0; i < Math.min(savedInputs.length, this.inputs.length); i++) {
-        this.inputs[i].link = savedInputs[i]?.link ?? null;
-      }
-    }
-
-    // Disable combo widget only when the choice slot is wired to a real
-    // upstream node (e.g. a saved Primitive).  Subgraph promotion links also
-    // populate inputs[0].link, but their origin node is a special InputNode
-    // that graph.getNodeById() does NOT return — use that to discriminate.
-    {
-      const choiceLinkId = this.inputs[0]?.link;
-      let isPrimitiveDriven = false;
-      if (choiceLinkId != null && this.graph) {
-        const link = this.graph._links?.get?.(choiceLinkId);
-        const originNode = link
-          ? this.graph.getNodeById?.(link.origin_id)
-          : null;
-        isPrimitiveDriven = originNode != null;
-      }
-      this._choiceWidget.disabled = isPrimitiveDriven;
-    }
-
-    // widgets_values[0] is the combo value (only widget).
-    const desired = savedWV?.[0];
+    const desired = data.widgets_values?.[0];
     if (desired && this._labels.includes(desired)) {
       this._choiceWidget.value = desired;
     }
@@ -511,7 +485,7 @@ function buildNodeClass(LG) {
     const selIdx  = this.selectedIndex;
     const inSlot  = this.inputs?.[selIdx];
     if (!inSlot || inSlot.link == null || !this.graph) return null;
-    const link = this.graph.links[inSlot.link];
+    const link = getGraphLink(this.graph, inSlot.link);
     if (!link) return null;
     const srcNode = this.graph.getNodeById(link.origin_id);
     if (!srcNode) return null;
@@ -533,22 +507,14 @@ function patchGraphToPrompt(comfyApp) {
   comfyApp.graphToPrompt = async function (...args) {
     const graph = comfyApp.graph;
 
-    // ── Capture full workflow state BEFORE nulling any links ─────────────────
-    // graphToPrompt() returns { workflow, output }.  workflow is what ComfyUI
-    // saves to disk / history.  We must capture it with all links intact so
-    // the saved file can be reloaded correctly.
+    // Capture workflow state before applying temporary runtime selections.
+    // graphToPrompt() returns { workflow, output }; preserve the editor's
+    // selected values and complete link topology in the saved workflow.
     const fullWorkflow = graph?.serialize ? graph.serialize() : null;
 
-    // ── Pre-serialise: disconnect unselected inputs ──────────────────────────
-    // Temporarily null out the link IDs for every unselected DropdownSwitch
-    // input before calling graphToPrompt.  This ensures ComfyUI's serialiser
-    // never traverses to those upstream nodes, so their subgraph internals
-    // won't appear in result.output and the backend won't execute them.
-    //
-    // If inputs[0] (the choice slot) is wired to a Primitive, we read the
-    // Primitive's current widget value and temporarily override the combo so
-    // that selectedIndex reflects the Primitive's runtime selection.
-    const savedLinks      = [];
+    // Resolve the runtime selection before prompt generation without changing
+    // graph links. Modern LiteGraph treats slot links as graph-owned state, so
+    // mutating only input.link can permanently disconnect the editor graph.
     const choiceOverrides = []; // { node, origValue }
     if (graph) {
       // Recursively walk a graph and any subgraphs it contains.
@@ -562,8 +528,7 @@ function patchGraphToPrompt(comfyApp) {
             // Priority 3: keep whatever _choiceWidget.value already holds.
             const choiceSlot = n.inputs?.[0];
             if (choiceSlot?.link != null) {
-              const link = g._links?.get?.(choiceSlot.link)
-                        ?? g.links?.[choiceSlot.link];
+              const link = getGraphLink(g, choiceSlot.link);
               const srcNode = link ? g.getNodeById?.(link.origin_id) : null;
               if (srcNode) {
                 // Primitive or other real upstream node drives the choice.
@@ -584,8 +549,7 @@ function patchGraphToPrompt(comfyApp) {
                   if (outerInput.link != null) {
                     // Outer input is itself connected to an upstream node.
                     const og        = outerNode.graph;
-                    const outerLink = og?._links?.get?.(outerInput.link)
-                                   ?? og?.links?.[outerInput.link];
+                    const outerLink = getGraphLink(og, outerInput.link);
                     const outerSrc  = outerLink
                       ? og?.getNodeById?.(outerLink.origin_id)
                       : null;
@@ -607,20 +571,6 @@ function patchGraphToPrompt(comfyApp) {
               }
             }
 
-            // ── Null out unselected input links ──────────────────────────────
-            const selIdx = n.selectedIndex;
-            for (let i = 0; i < (n.inputs?.length ?? 0); i++) {
-              if (i === selIdx) continue;
-              // Never null out the choice slot (index 0) — the Primitive /
-              // SubgraphInput wire must stay in the serialised workflow so it
-              // reloads correctly.
-              if (i === 0) continue;
-              const inp = n.inputs[i];
-              if (inp?.link != null) {
-                savedLinks.push({ inp, link: inp.link });
-                inp.link = null;
-              }
-            }
           }
 
           // ── Recurse into subgraph nodes ────────────────────────────────────
@@ -637,20 +587,15 @@ function patchGraphToPrompt(comfyApp) {
     try {
       result = await original(...args);
     } finally {
-      // Always restore, even if original() throws.
-      for (const { inp, link } of savedLinks) {
-        inp.link = link;
-      }
+      // Always restore temporary widget values, even if original() throws.
       for (const { node, origValue } of choiceOverrides) {
         node._choiceWidget.value = origValue;
       }
     }
 
-    // ── Restore full workflow in the result ──────────────────────────────────
-    // original() serialised the graph with our nulled links, so result.workflow
-    // would have only the selected link.  Replace it with the pre-captured full
-    // state so that ComfyUI saves (history, auto-save, Ctrl+S) preserve all
-    // connections and the workflow reloads correctly.
+    // Keep prompt-time choice overrides and any frontend serialization details
+    // out of the persisted workflow; it represents the editor state captured
+    // before prompt generation began.
     if (result?.workflow && fullWorkflow) {
       result.workflow = fullWorkflow;
     }
@@ -693,7 +638,7 @@ function patchGraphToPrompt(comfyApp) {
         return { value: null }; // nothing connected
       }
 
-      const link = graph.links[inSlot.link];
+      const link = getGraphLink(graph, inSlot.link);
       if (!link) return { value: null };
 
       return resolveOutput(link.origin_id, link.origin_slot, visited);
@@ -709,7 +654,7 @@ function patchGraphToPrompt(comfyApp) {
         const inSlot = liveNode.inputs[inputIdx];
         if (inSlot.link == null) continue;
 
-        const link = graph.links[inSlot.link];
+        const link = getGraphLink(graph, inSlot.link);
         if (!link) continue;
 
         const originNode = nodeMap[link.origin_id];
