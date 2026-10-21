@@ -21,7 +21,7 @@ Search for **Dropdown Switch** in the Custom Nodes list and install.
 ### Manual
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/YOUR_USERNAME/ComfyUI-Dropdown-Switch
+git clone https://github.com/DRuggeri/ComfyUI-Dropdown-Switch.git
 ```
 No extra dependencies — this is a frontend-only node with no Python packages required.
 
