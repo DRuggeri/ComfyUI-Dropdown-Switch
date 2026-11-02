@@ -314,19 +314,27 @@ function buildNodeClass(LG) {
     const from = fromLabelIdx + 1;
     const to   = toLabelIdx   + 1;
 
-    // Swap the slot objects (each carries .name, .type, .link)
-    [this.inputs[from], this.inputs[to]] =
-      [this.inputs[to], this.inputs[from]];
+    // Capture upstream connections before touching slots
+    const graph = this.graph;
+    const origin = (slot) => {
+      const l = slot?.link != null ? graph?.links?.[slot.link] ?? graph?._links?.get?.(slot.link) : null;
+      return l ? { node: graph.getNodeById(l.origin_id), slot: l.origin_slot } : null;
+    };
+    const srcFrom = origin(this.inputs[from]);
+    const srcTo   = origin(this.inputs[to]);
 
-    // Swap labels
+    // Swap names (slots stay in place) and labels
+    [this.inputs[from].name, this.inputs[to].name] =
+      [this.inputs[to].name, this.inputs[from].name];
     [this._labels[fromLabelIdx], this._labels[toLabelIdx]] =
       [this._labels[toLabelIdx], this._labels[fromLabelIdx]];
 
-    // Update every graph link that targets this node
-    for (const link of getGraphLinks(this.graph)) {
-      if (link.target_id !== this.id) continue;
-      if      (link.target_slot === from) link.target_slot = to;
-      else if (link.target_slot === to)   link.target_slot = from;
+    // Reconnect each upstream output to the other slot so links follow the item
+    if (srcFrom || srcTo) {
+      this.disconnectInput(from);
+      this.disconnectInput(to);
+      srcFrom?.node?.connect(srcFrom.slot, this, to);
+      srcTo?.node?.connect(srcTo.slot, this, from);
     }
 
     // Re-sync combo, preserving the currently selected label by name
@@ -347,17 +355,25 @@ function buildNodeClass(LG) {
     const newName = `input_${n}`;
     const slot = labelIdx + 1;
 
-    // addInput always appends; pop it off the end and splice into position
+    // Capture upstream connections of every slot that will shift down by one
+    const graph = this.graph;
+    const sources = [];
+    for (let i = slot; i < this.inputs.length; i++) {
+      const id = this.inputs[i].link;
+      const l = id != null ? graph?.links?.[id] ?? graph?._links?.get?.(id) : null;
+      sources.push(l ? { node: graph.getNodeById(l.origin_id), slot: l.origin_slot } : null);
+    }
+
+    // Append a slot, then shift names down so slot `slot` becomes the empty one
     this.addInput(newName, "*");
-    const newSlot = this.inputs.pop();
-    this.inputs.splice(slot, 0, newSlot);
+    for (let i = this.inputs.length - 1; i > slot; i--) {
+      this.inputs[i].name = this.inputs[i - 1].name;
+    }
+    this.inputs[slot].name = newName;
     this._labels.splice(labelIdx, 0, newName);
 
-    // Slots that were at index >= slot are now at index >= slot+1
-    for (const link of getGraphLinks(this.graph)) {
-      if (link.target_id !== this.id) continue;
-      if (link.target_slot >= slot) link.target_slot++;
-    }
+    for (let i = slot; i < this.inputs.length - 1; i++) this.disconnectInput(i);
+    sources.forEach((src, k) => src?.node?.connect(src.slot, this, slot + 1 + k));
 
     const sel = this._choiceWidget?.value;
     this._syncChoiceValues();
